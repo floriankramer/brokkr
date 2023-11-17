@@ -1,0 +1,63 @@
+// The root parsing instructive
+program = _{ SOI ~ function* ~ EOI }
+
+// A function definition
+function = { function_signature ~ function_body }
+
+// The signature of a function (e,g, uint64 calculate(uint64 a, uint64 b))
+function_signature = { types ~ name ~ "(" ~ function_arguments ~ ")" }
+
+// Function arguments. Function arguments must be separated by commas
+function_arguments = { (types ~ name)? ~ (", " ~ types ~ name)* }
+
+// The body of a function
+function_body = { "{" ~ expression* ~ "}" }
+
+// Globals
+global_definition = { "global" ~ types ~ name ~ "=" ~ literal ~ terminator }
+
+// A literal value
+literal = { string_literal | float_literal | array_literal | integer_literal }
+
+string_literal = { "\"" ~ (!"\"" ~ ("\\\"" | ANY))* ~ "\"" }
+
+integer_literal = { "-"? ~ ASCII_DIGIT+ }
+
+float_literal = { "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+
+array_literal = { "[" ~ (integer_literal)? ~ ("," ~ integer_literal)* ~ "]"}
+
+// Expressions (assignment, call, if, while, invert)
+expression = { assignment_expression | call_expression | if_expression | while_expression | invert_expression | return_expression }
+
+// Assignments which modify in place
+assignment_expression = { types? ~ name ~ assignment_operation ~ (name | literal) ~ terminator }
+assignment_operation = { "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "<<=" | ">>=" | "^=" | "|=" | "&="}
+
+// function calls (either application defined functions, or syscalls)
+call_expression = { (types? ~ name ~ "=")? ~ name ~ "(" ~ call_arguments ~ ")" ~ terminator }
+call_arguments = { (name | literal)? ~ ("," ~ (name | literal))* } 
+
+// if expression
+if_expression = { "if" ~ "(" ~ name ~ ")" ~ function_body }
+
+// while expression
+while_expression = { "while" ~ "(" ~ name ~ ")" ~ function_body }
+
+// invert expression
+invert_expression = { "!" ~ name ~ terminator }
+
+// return
+return_expression = { "return" ~ (name | literal)? ~ terminator }
+
+// Any valid name
+name = { (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// All type keywords, supported by the language
+types = { "void" | "uint64" | "double" | "uint8*" }
+
+terminator = { ";" }
+
+// Use implicit whitespace and comments
+WHITESPACE = _{ " " | "\t" | NEWLINE }
+COMMENT = _{ "//" ~ (!NEWLINE ~ ANY)* ~ NEWLINE }

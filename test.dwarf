@@ -1,0 +1,13 @@
+uint64 add(uint64 a, uint8* test) {
+ uint64 c = a;
+ c += b;
+ return c;
+}
+
+// the entry point
+uint64 main() {
+  uint64 a = 3;
+  uint64 b = 4;
+  uint64 c = add(a, b);
+  return c;
+}
