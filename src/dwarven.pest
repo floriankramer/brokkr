@@ -1,5 +1,5 @@
 // The root parsing instructive
-program = _{ SOI ~ function* ~ EOI }
+program = _{ SOI ~ (function | global_definition)* ~ EOI }
 
 // A function definition
 function = { function_signature ~ function_body }

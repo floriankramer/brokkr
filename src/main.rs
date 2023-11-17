@@ -1,9 +1,11 @@
-use std::io::Read;
+use std::{io::Read, path::PathBuf};
 
 use anyhow::Result;
+use pest::Parser;
 
 pub mod parser;
 pub mod elf;
+pub mod compiler;
 
 
 fn main() -> Result<()> {
@@ -13,13 +15,15 @@ fn main() -> Result<()> {
   stdin.read_to_string(&mut src)?;
 
   // Parse the source code
-  parser::verify(src)?;
+  let parsed = parser::DwarvenParser::parse(parser::Rule::program, &src)?;
 
-  // Collect global symbol information (functions and values)
+  let compiled = compiler::compile(parsed)?;
 
-  // Build the data section from globals
+  let mut path = PathBuf::new();
+  path.push("out");
 
-  // Build the text section from the functions
+  let mut out = elf::ElfFile::new(&path); 
+  out.write(compiled.text, compiled.data)?;
   
   Ok(())
 }

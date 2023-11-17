@@ -10,3 +10,12 @@ The compiler is written in rust. It can be built using `cargo build`, and run
 using `cargo run`. It expects a single file as an input, and produces a
 x86 64 bit elf file as it's output. The elf has no dependency, apart from a
 reasonably up-to-date linux kernel for the syscalls.
+
+### Neovim syntax highlighting
+For basic neovim syntax highlighting, run the following
+```
+mkdir -p ~/.config/nvim/syntax
+mkdir -p ~/.config/nvim/ftdetect
+cp ./syntax.vim ~/.config/nvim/syntax/brkr.vim
+cp ./filetype.vim ~/.config/nvim/ftdetect/brkr.vim
+```
