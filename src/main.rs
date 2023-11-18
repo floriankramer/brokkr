@@ -23,7 +23,7 @@ fn main() -> Result<()> {
   path.push("out");
 
   let mut out = elf::ElfFile::new(&path); 
-  out.write(compiled.text, compiled.data)?;
+  out.write(compiled.text, compiled.data, compiled.entrypoint)?;
   
   Ok(())
 }

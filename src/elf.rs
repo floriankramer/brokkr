@@ -1,4 +1,4 @@
-use std::{path::{Path, PathBuf}, mem::size_of};
+use std::{path::{Path, PathBuf}, mem::size_of, io::Write};
 
 use anyhow::Result;
 
@@ -14,29 +14,57 @@ impl ElfFile {
     }
 
     /// write writes the given program as an executable elf file to disk.
-    pub fn write(&mut self, program: Vec<u8>, entry_point: u64) -> Result<()> {
+    pub fn write(&mut self, text: Vec<u8>, data: Vec<u8>, entry_point: u64) -> Result<()> {
         // create a default header for a 64-bit x86 executable.
-        let mut header = ElfHeader::default();
+        let mut header = ElfHeader {
+          e_entry: entry_point,
+          e_phoff: size_of::<ElfHeader>() as u64,
+          e_phentsize: size_of::<ProgramHeaderTableEntry>() as u16,
+          e_phnum: 2,
+          ..Default::default()
+        };
         header.e_entry = entry_point;
 
         // Build the program header table
+        // First we have the text segment
+        let text_row = ProgramHeaderTableEntry {
+          p_type: ProgramHeaderType::Load,
+          p_flags: PH_FLAGS_READ | PH_FLAGS_EXECUTE,
+          p_vaddr: 0,
+          p_offset: (size_of::<ElfHeader>() + size_of::<ProgramHeaderTableEntry>()) as u64,
+          p_filesz: text.len() as u64,
+          p_memsz: text.len() as u64,
+          ..Default::default()
+        };
+
+        let data_row = ProgramHeaderTableEntry {
+          p_type: ProgramHeaderType::Load,
+          p_flags: PH_FLAGS_READ | PH_FLAGS_WRITE,
+          p_vaddr: 0,
+          p_offset: (size_of::<ElfHeader>() + size_of::<ProgramHeaderTableEntry>() + text.len()) as u64,
+          p_filesz: data.len() as u64,
+          p_memsz: data.len() as u64,
+          ..Default::default()
+        };
 
         // Elf also can contain a section header table, but it's only needed for dynamic linking.
         // We can skip that (just don't support it)
 
-        // Update the elf header with the program and section header information
-        header.e_phoff = size_of::<ElfHeader>() as u64;
-        // TODO: Set this to the size of the program header struct.
-        header.e_phentsize = 16;
-        header.e_phnum = 1;
+
+        let mut out = std::fs::File::create(&self.path)?;
 
         // Write the header
+        out.write_all(bytes_of(&header))?;
         
         // write the program header table
+        out.write_all(bytes_of(&text_row))?;
+        out.write_all(bytes_of(&data_row))?;
 
         // write the text section
+        out.write_all(&text)?;
 
         // write the data section
+        out.write_all(&data)?;
 
         Ok(())
     }
@@ -178,13 +206,39 @@ pub enum MachineType {
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct ProgramHeaderTableEntry {
-
+  p_type: ProgramHeaderType,
+  // The meaning of these depends on the type
+  p_flags: u32,
+  p_offset: u64,
+  p_vaddr: u64,
+  p_filesz: u64,
+  p_memsz: u64,
+  p_align: u64,
 }
 
 #[repr(u32)]
 pub enum ProgramHeaderType {
+  // Do nothing. All other fields are ignored
   Null = 0,
+  // Load a segment into memory
   Load = 1,
   // There are more types defined in elf.h, but we don't need them
+}
+
+impl Default for ProgramHeaderType {
+  fn default() -> Self {
+      Self::Null
+  }
+}
+
+const PH_FLAGS_EXECUTE: u32 = 0x1;
+const PH_FLAGS_WRITE: u32 = 0x2;
+const PH_FLAGS_READ: u32 = 0x4;
+
+fn bytes_of<T>(t: &T) -> &[u8] {
+  unsafe {
+    ::core::slice::from_raw_parts((t as *const T) as *const u8, size_of::<T>())
+  }
 }
