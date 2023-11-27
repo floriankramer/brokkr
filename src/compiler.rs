@@ -17,7 +17,9 @@ pub fn compile(parsed: pest::iterators::Pairs<'_, parser::Rule>) -> Result<Compi
 
   // Build the text section from the functions
   let text = vec![
-    0xb8, // move eax
+    // TODO: This is 0xb8 + the regsite something. Might be based upon the Adressing Forms table in the
+    // intel manual.
+    0xb8, // move eax (For using rax we'd need a rex prefix)
     60, // 60
     0,
     0,
@@ -27,13 +29,9 @@ pub fn compile(parsed: pest::iterators::Pairs<'_, parser::Rule>) -> Result<Compi
     0,
     0,
     0,
-    0x0f, // syscall
+    0x0f, // syscall (0f 05)
     0x05
   ];
-  // TODO: Find the bytecode for the following instructions
-  // mov rax, 60
-  // mov rdi, 42
-  // syscall
   
   let data = vec![b'h', b'e', b'l', b'l', b'o', b' ', b'w', b'o', b'r', b'l', b'd', b'!'];
 

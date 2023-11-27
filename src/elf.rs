@@ -5,6 +5,11 @@ use anyhow::Result;
 // Align to 4KiB
 const ALIGNMENT: u64 = 4096; 
 
+/// The kernel will not load any code into addresses below this constant. As the executables
+/// we produce are not relocateable, we need to make sure that all program header sections load
+/// to memory after this address.
+const KERNEL_MIN_LOAD_ADDRESS: u64 = 0x10000;
+
 pub struct ElfFile {
     path: PathBuf,
 }
@@ -20,45 +25,45 @@ impl ElfFile {
     pub fn write(&mut self, text: Vec<u8>, data: Vec<u8>, entry_point: u64) -> Result<()> {
         // create a default header for a 64-bit x86 executable.
         let header = ElfHeader {
-          e_entry: 0x400000 + entry_point,
+          e_entry: KERNEL_MIN_LOAD_ADDRESS + entry_point,
           e_phoff: size_of::<ElfHeader>() as u64,
           e_phentsize: size_of::<ProgramHeaderTableEntry>() as u16,
           e_phnum: 2,
           ..Default::default()
         };
 
-        // TODO: The offset of 0x400000 was taken from nasm output of my game of life project
-        // the elf file can be loaded with that, but I don't yet know why this high offset is
-        // needed.
-
         // Build the program header table
         // First we have the text segment
         let text_row = ProgramHeaderTableEntry {
           p_type: ProgramHeaderType::Load,
           p_flags: PH_FLAGS_READ | PH_FLAGS_EXECUTE,
-          p_vaddr: 0x400000,
-          p_paddr: 0x400000,
-          p_offset: ALIGNMENT, //(size_of::<ElfHeader>() + size_of::<ProgramHeaderTableEntry>()) as u64,
+          p_vaddr: KERNEL_MIN_LOAD_ADDRESS,
+          p_paddr: KERNEL_MIN_LOAD_ADDRESS,
+          p_offset: ALIGNMENT, 
           p_filesz: text.len() as u64,
           p_memsz: text.len() as u64,
           p_align: ALIGNMENT,
         };
 
-        // TODO: This fails for text larger than ALIGNMENT
+        // pad the size of text to a multiple of ALIGNMENT (which is a power of 2)
+        let text_aligned_size = ((text.len() as u64) + ALIGNMENT - 1) & !(ALIGNMENT - 1);
+        println!("text aligned size: {} -> {}", text.len(), text_aligned_size);
+
         let data_row = ProgramHeaderTableEntry {
           p_type: ProgramHeaderType::Load,
           p_flags: PH_FLAGS_READ | PH_FLAGS_WRITE,
-          p_vaddr: 0x401000,//text.len() as u64,
-          p_paddr: 0x401000,
+          p_vaddr: KERNEL_MIN_LOAD_ADDRESS + text_aligned_size,
+                                                     // section
+          p_paddr: KERNEL_MIN_LOAD_ADDRESS + text_aligned_size,
           p_offset: 2 * ALIGNMENT,//(size_of::<ElfHeader>() + size_of::<ProgramHeaderTableEntry>() + text.len()) as u64,
           p_filesz: data.len() as u64,
           p_memsz: data.len() as u64,
           p_align: ALIGNMENT,
         };
 
-        // Elf also can contain a section header table, but it's only needed for dynamic linking.
+        // Elf also can contain a section header table, but it's only needed for dynamic linking or
+        // adding location information (e.g. asm label style address labels).
         // We can skip that (just don't support it)
-
 
         let mut out = std::fs::File::create(&self.path)?;
 
@@ -81,7 +86,7 @@ impl ElfFile {
         out.write_all(&text)?;
 
         // pad to 2x ALIGNMENT
-        out.seek(SeekFrom::Start(2 * ALIGNMENT))?;
+        out.seek(SeekFrom::Start(ALIGNMENT + text_aligned_size))?;
 
         // write the data section
         out.write_all(&data)?;
