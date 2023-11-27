@@ -1,6 +1,9 @@
-use std::{path::{Path, PathBuf}, mem::size_of, io::Write};
+use std::{path::{Path, PathBuf}, mem::size_of, io::{Write, Seek, SeekFrom}, fs, os::unix::prelude::PermissionsExt};
 
 use anyhow::Result;
+
+// Align to 4KiB
+const ALIGNMENT: u64 = 4096; 
 
 pub struct ElfFile {
     path: PathBuf,
@@ -16,35 +19,41 @@ impl ElfFile {
     /// write writes the given program as an executable elf file to disk.
     pub fn write(&mut self, text: Vec<u8>, data: Vec<u8>, entry_point: u64) -> Result<()> {
         // create a default header for a 64-bit x86 executable.
-        let mut header = ElfHeader {
-          e_entry: entry_point,
+        let header = ElfHeader {
+          e_entry: 0x400000 + entry_point,
           e_phoff: size_of::<ElfHeader>() as u64,
           e_phentsize: size_of::<ProgramHeaderTableEntry>() as u16,
           e_phnum: 2,
           ..Default::default()
         };
-        header.e_entry = entry_point;
+
+        // TODO: The offset of 0x400000 was taken from nasm output of my game of life project
+        // the elf file can be loaded with that, but I don't yet know why this high offset is
+        // needed.
 
         // Build the program header table
         // First we have the text segment
         let text_row = ProgramHeaderTableEntry {
           p_type: ProgramHeaderType::Load,
           p_flags: PH_FLAGS_READ | PH_FLAGS_EXECUTE,
-          p_vaddr: 0,
-          p_offset: (size_of::<ElfHeader>() + size_of::<ProgramHeaderTableEntry>()) as u64,
+          p_vaddr: 0x400000,
+          p_paddr: 0x400000,
+          p_offset: ALIGNMENT, //(size_of::<ElfHeader>() + size_of::<ProgramHeaderTableEntry>()) as u64,
           p_filesz: text.len() as u64,
           p_memsz: text.len() as u64,
-          ..Default::default()
+          p_align: ALIGNMENT,
         };
 
+        // TODO: This fails for text larger than ALIGNMENT
         let data_row = ProgramHeaderTableEntry {
           p_type: ProgramHeaderType::Load,
           p_flags: PH_FLAGS_READ | PH_FLAGS_WRITE,
-          p_vaddr: 0,
-          p_offset: (size_of::<ElfHeader>() + size_of::<ProgramHeaderTableEntry>() + text.len()) as u64,
+          p_vaddr: 0x401000,//text.len() as u64,
+          p_paddr: 0x401000,
+          p_offset: 2 * ALIGNMENT,//(size_of::<ElfHeader>() + size_of::<ProgramHeaderTableEntry>() + text.len()) as u64,
           p_filesz: data.len() as u64,
           p_memsz: data.len() as u64,
-          ..Default::default()
+          p_align: ALIGNMENT,
         };
 
         // Elf also can contain a section header table, but it's only needed for dynamic linking.
@@ -53,15 +62,26 @@ impl ElfFile {
 
         let mut out = std::fs::File::create(&self.path)?;
 
+        out.set_permissions(PermissionsExt::from_mode(0o0755))?;
+
         // Write the header
+        println!("header: {:?}", header);
         out.write_all(bytes_of(&header))?;
         
         // write the program header table
+        println!("text_row: {:?}", text_row);
+        println!("data_row: {:?}", data_row);
         out.write_all(bytes_of(&text_row))?;
         out.write_all(bytes_of(&data_row))?;
 
+        // pad to 1x ALIGNMENT
+        out.seek(SeekFrom::Start(ALIGNMENT))?;
+
         // write the text section
         out.write_all(&text)?;
+
+        // pad to 2x ALIGNMENT
+        out.seek(SeekFrom::Start(2 * ALIGNMENT))?;
 
         // write the data section
         out.write_all(&data)?;
@@ -97,6 +117,7 @@ const LINUX_OS_ABI: u8 = 3;
 /// ElfHeader is a c compatible reprensentation of an elf file's header. It should
 /// be located at byte 0 in the file.
 #[repr(C)]
+#[derive(Debug)]
 struct ElfHeader {
     // Basic information about the elf file
     e_ident: ElfIdent,
@@ -152,6 +173,7 @@ impl Default for ElfHeader {
 }
 
 #[repr(C)]
+#[derive(Debug)]
 struct ElfIdent {
     magic_byte_0: u8,
     magic_byte_1: u8,
@@ -190,6 +212,7 @@ impl Default for ElfIdent {
 
 /// The type of the elf file
 #[repr(u16)]
+#[derive(Debug)]
 pub enum FileType {
     None = 0,
     Relocateable = 1,
@@ -200,25 +223,34 @@ pub enum FileType {
 
 /// The type of the elf file
 #[repr(u16)]
+#[derive(Debug)]
 pub enum MachineType {
     None = 0,
     X86_64 = 62
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct ProgramHeaderTableEntry {
   p_type: ProgramHeaderType,
   // The meaning of these depends on the type
   p_flags: u32,
+  // offset into the elf file
   p_offset: u64,
+  // memory location to load into
   p_vaddr: u64,
+  // used for physical addressing
+  p_paddr: u64,
+  // size in the file
   p_filesz: u64,
+  // size in memory
   p_memsz: u64,
+  // Alignment of the data. 0 for no alignment
   p_align: u64,
 }
 
 #[repr(u32)]
+#[derive(Debug)]
 pub enum ProgramHeaderType {
   // Do nothing. All other fields are ignored
   Null = 0,
