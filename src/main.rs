@@ -19,7 +19,8 @@ fn main() -> Result<()> {
   // Parse the source code
   let parsed = parser::DwarvenParser::parse(parser::Rule::program, &src)?;
 
-  let compiled = compiler::compile(parsed)?;
+  let compiler = compiler::Compiler::default();
+  let compiled = compiler.compile(parsed)?;
 
   let mut path = PathBuf::new();
   path.push("out");

@@ -1,4 +1,4 @@
-use std::{any, error::Error, rc::Rc};
+use std::{any, collections::HashMap, error::Error, rc::Rc};
 
 use anyhow::{anyhow, Ok, Result};
 
@@ -10,162 +10,339 @@ pub struct CompiledProgram {
   pub entrypoint: u64,
 }
 
-pub fn compile(parsed: pest::iterators::Pairs<'_, parser::Rule>) -> Result<CompiledProgram> {
-  // Collect global symbol information (functions and values)
+#[derive(Default)]
+pub struct Compiler {
+  // The compiled program code
+  text: Vec<u8>,
+  // The compiled data section
+  data: Vec<u8>,
+  symbols: HashMap<String, Symbol>,
+  local_symbols: HashMap<String, LocalSymbol>,
 
-  // Initialize the data section from globals
+  relative_data_locations: Vec<RelativeDataLocation>,
+}
 
-  // Build the text section from the functions
+enum Symbol {
+  // TODO: These are missing data
+  Function(FunctionSymbol),
+  Global(GlobalSymbol),
+}
 
-  let mut text = Vec::new();
-  let mut data = Vec::new();
+struct GlobalSymbol {
+  // The relative address of the global in the data section (relative to the start of the section)
+  relative_address: Option<u64>,
+}
 
-  // For now, we only look at the main function
-  for value in parsed {
-    if value.as_rule() == parser::Rule::function {
-      let mut function_parts = value.into_inner();
-      if function_parts.len() != 2 {
-        return Err(anyhow!(
-          "Expectd two parts in a function, got {}",
-          function_parts.len()
-        ));
-      }
+struct FunctionSymbol {
+  // The address of a function relative to the start of the text section.
+  // May be None if the function is known, but not yet compiled
+  relative_address: Option<u64>,
+  // Function argument types. Their names aren't important.
+  arguments: Vec<BrokkrType>,
+  // The return type of the function.
+  return_type: BrokkrType,
+}
 
-      let signature = function_parts.next().unwrap();
-      let mut body = function_parts.next().unwrap().into_inner();
+/// LocalSymbol represents a symbol in the local context, by combining it with a bracket depth.
+struct LocalSymbol {
+  symbol: Symbol,
+  // The depth in braces of this symbol. Used to keep symbols inside of e.g. if clauses.
+  depth: u64,
+}
 
-      let mut signature_parts = signature.into_inner();
-      let return_type = signature_parts.next().unwrap();
-      let function_name = signature_parts.next().unwrap().as_str().to_string();
+/// RelativeDataLocation describes an address in the data section of the compiled code. These need
+/// to be stored during compilation, and then updated once the location of the data section is
+/// known.
+struct RelativeDataLocation {
+  // The offset in the text section at which the value lies
+  offset: u64,
+  // The value's size
+  size: u8,
+  // The relative location to which the start of the data section has to be added
+  relative_location: u64,
+}
 
-      let mut function_arguments = signature_parts.next().unwrap().into_inner();
+impl Compiler {
+  pub fn compile(
+    mut self,
+    parsed: pest::iterators::Pairs<'_, parser::Rule>,
+  ) -> Result<CompiledProgram> {
+    // Collect global symbol information (functions and values)
+    // this populates self.symbols
+    self.collect_smbols()?;
 
-      // Debug code
-      if function_name != "main" {
-        log::info!("Ignoring non main function {} in this build", function_name);
-        continue;
-      }
+    // Initialize the data section from globals
 
-      if function_name == "main" {
-        // sanity checks
-        if function_arguments.clone().next().is_some() {
-          return Err(anyhow!("the main function may not take any arguments"));
+    // Build the text section from the functions
+
+    // For now, we only look at the main function
+    for value in parsed {
+      if value.as_rule() == parser::Rule::function {
+        let mut function_parts = value.into_inner();
+        if function_parts.len() != 2 {
+          return Err(anyhow!(
+            "Expectd two parts in a function, got {}",
+            function_parts.len()
+          ));
         }
 
-        if return_type.as_str() != "uint64" {
-          return Err(anyhow!("the main function must return uint64"));
+        let signature = function_parts.next().unwrap();
+        let mut body = function_parts.next().unwrap().into_inner();
+
+        let mut signature_parts = signature.into_inner();
+        let return_type = signature_parts.next().unwrap();
+        let function_name = signature_parts.next().unwrap().as_str().to_string();
+
+        let mut function_arguments = signature_parts.next().unwrap().into_inner();
+
+        // Debug code
+        if function_name != "main" {
+          log::info!("Ignoring non main function {} in this build", function_name);
+          continue;
         }
-      }
 
-      // compile the function
-      // TODO: we want a local function table that tracks scoped variables.
-      for expression in body {
-        let typed_expression = expression.into_inner().next().unwrap();
-
-        match typed_expression.as_rule() {
-          parser::Rule::call_expression => {
-            let call_parts: Vec<_> = typed_expression.into_inner().collect();
-
-            // <name> <args> <terminator>
-            if call_parts.len() != 3 {
-              return Err(anyhow!(
-                "Assigning the result of a function to a variable is not yet supported"
-              ));
-            }
-
-            let function_name = call_parts[0].as_str().to_string();
-            let function_arguments: Vec<_> = call_parts[1].clone().into_inner().collect();
-
-            // TODO: To handle this properlywe want a list of syscalls, prevent those from being
-            // used as function names, and then check function calls agains the global symbol
-            // table and the syscall table.
-            if function_name != "exit" {
-              // exit is the only supported function right now, it's a syscall
-              return Err(anyhow!("Only the exit syscall is supported right now"));
-            }
-
-            // exit syscall implementation. This needs to be moved into a proper place later on.
-            // preferably a function that takes the global and local symbol tables and the
-            // function args.
-            if function_arguments.len() != 1 {
-              return Err(anyhow!("The exit function takes exactly one argument"));
-            }
-
-            let first_arg = function_arguments[0].clone().into_inner().next().unwrap();
-            if first_arg.as_rule() != parser::Rule::integer_literal {
-              return Err(anyhow!(
-                "The exit function currently only supports integer literals, but got a {:?}",
-                first_arg.as_rule()
-              ));
-            }
-
-            let ret_code: u64 = first_arg.as_str().parse()?; 
-
-            // TODO: this should be a helper function as in mov_immediate(Register::rax, Syscalls::Exit);
-            // move rax
-            text.push(0xb8);
-            text.push(Syscalls::Exit as u8);
-            text.push(0);
-            text.push(0);
-            text.push(0);
-
-            // mov edi
-            text.push(0xbf);
-            text.push((ret_code & 0xFF) as u8);
-            text.push(((ret_code >> 8) & 0xFF) as u8);
-            text.push(((ret_code >> 16) & 0xFF) as u8);
-            text.push(((ret_code >> 24) & 0xFF) as u8);
-
-            // syscall
-            // TODO: this should also be a helper
-            text.push(0x0f);
-            text.push(0x05);
-
-            
+        if function_name == "main" {
+          // sanity checks
+          if function_arguments.clone().next().is_some() {
+            return Err(anyhow!("the main function may not take any arguments"));
           }
-          _ => {
+
+          if return_type.as_str() != type_to_string(BrokkrType::UInt64) {
             return Err(anyhow!(
-              "Statements of typpe {:?} are not supported yet",
-              typed_expression.as_rule()
-            ))
+              "the main function must return {}",
+              type_to_string(BrokkrType::UInt64)
+            ));
+          }
+        }
+
+        // compile the function
+        // TODO: we want a local function table that tracks scoped variables.
+        for expression in body {
+          let typed_expression = expression.into_inner().next().unwrap();
+
+          match typed_expression.as_rule() {
+            parser::Rule::call_expression => {
+              let call_parts: Vec<_> = typed_expression.into_inner().collect();
+
+              // <name> <args> <terminator>
+              if call_parts.len() != 3 {
+                return Err(anyhow!(
+                  "Assigning the result of a function to a variable is not yet supported"
+                ));
+              }
+
+              let function_name = call_parts[0].as_str().to_string();
+              let function_arguments: Vec<_> = call_parts[1].clone().into_inner().collect();
+
+              // TODO: To handle this properly we want a list of syscalls, prevent those from being
+              // used as function names, and then check function calls agains the global symbol
+              // table and the syscall table.
+              // TODO: Add the print function to this.
+              if function_name != "exit" {
+                // exit is the only supported function right now, it's a syscall
+                return Err(anyhow!("Only the exit syscall is supported right now"));
+              }
+
+              self.write_syscall_exit(function_arguments)?;
+            }
+            _ => {
+              return Err(anyhow!(
+                "Statements of typpe {:?} are not supported yet",
+                typed_expression.as_rule()
+              ))
+            }
           }
         }
       }
     }
+
+    // TODO: Adjust relative data locations
+    // iterate the relative_data_locations and calculate their in memory locations using the
+    // ALIGNMENT from elf.rs as well as the KERNEL_MIN_LOAD_ADDRESS. There should probably be a
+    // helper inside of elf.rs for this. It's not the cleanest separation of concerns, but should
+    // be fine for this basic compiler project.
+
+    Ok(CompiledProgram {
+      text: self.text,
+      data: self.data,
+      entrypoint: 0,
+    })
   }
-  // let text = vec![
-  //   // TODO: This is 0xb8 + the regsite something. Might be based upon the Adressing Forms table in the
-  //   // intel manual.
-  //   0xb8, // move eax (For using rax we'd need a rex prefix)
-  //   60, // 60
-  //   0,
-  //   0,
-  //   0,
-  //   0xbf, // mov edi
-  //   42, // 42
-  //   0,
-  //   0,
-  //   0,
-  //   0x0f, // syscall (0f 05)
-  //   0x05
-  // ];
 
-  // let data = vec![b'h', b'e', b'l', b'l', b'o', b' ', b'w', b'o', b'r', b'l', b'd', b'!'];
+  fn collect_smbols(&mut self) -> Result<()> {
+    Ok(())
+  }
 
-  Ok(CompiledProgram {
-    text,
-    data,
-    entrypoint: 0,
-  })
-}
+  // syscalls
 
-fn collect_smbols() -> Result<()> {
-  Ok(())
+  fn write_syscall_exit(
+    &mut self,
+    arguments: Vec<pest::iterators::Pair<'_, parser::Rule>>,
+  ) -> Result<()> {
+    if arguments.len() != 1 {
+      return Err(anyhow!("The exit function takes exactly one argument"));
+    }
+
+    let first_arg = arguments[0].clone().into_inner().next().unwrap();
+    if first_arg.as_rule() != parser::Rule::integer_literal {
+      return Err(anyhow!(
+        "The exit function currently only supports integer literals, but got a {:?}",
+        first_arg.as_rule()
+      ));
+    }
+
+    let ret_code: u64 = first_arg.as_str().parse()?;
+
+    // call the exit syscall with a single return code argument
+    Self::write_mov_immediate_64(Register64::Rax, Syscalls::Exit as u64, &mut self.text);
+    Self::write_mov_immediate_64(Register64::Rdi, ret_code, &mut self.text);
+    Self::write_syscall(&mut self.text);
+
+    Ok(())
+  }
+
+  // TODO: The syscall is write, print should just be a wrapper around that.
+  fn write_syscall_print(
+    &mut self,
+    arguments: Vec<pest::iterators::Pair<'_, parser::Rule>>,
+  ) -> Result<()> {
+    if arguments.len() != 2 {
+      return Err(anyhow!("The print function takes exactly two arguments"));
+    }
+
+    let first_arg = arguments[0].clone().into_inner().next().unwrap();
+    if first_arg.as_rule() != parser::Rule::string_literal {
+      return Err(anyhow!(
+        "The print function currently only supports string literals, but got a {:?}",
+        first_arg.as_rule()
+      ));
+    }
+
+    let second_arg = arguments[1].clone().into_inner().next().unwrap();
+    if second_arg.as_rule() != parser::Rule::integer_literal {
+      return Err(anyhow!(
+        "The print function currently only supports integer literals, but got a {:?}",
+        first_arg.as_rule()
+      ));
+    }
+
+    let string_literal = first_arg.as_str().to_string();
+    let string_length: u64 = second_arg.as_str().parse()?;
+
+    // add the string literal to the data section
+    let relative_literal_location = self.data.len() as u64;
+    self.data.extend_from_slice(string_literal.as_bytes());
+
+    // call the exit syscall with a single return code argument
+    Self::write_mov_immediate_64(Register64::Rax, Syscalls::Write as u64, &mut self.text);
+    Self::write_mov_immediate_64(Register64::Rdi, 1, &mut self.text);
+
+    // We refer to the literal in the data section here and need to modify this later on to hold
+    // the actual location of the data.
+    self.relative_data_locations.push(RelativeDataLocation {
+      // the mov instruction takes 2 bytes.
+      offset: self.text.len() as u64 + 2,
+      size: 8,
+      relative_location: relative_literal_location,
+    });
+    Self::write_mov_immediate_64(Register64::Rsi, relative_literal_location, &mut self.text);
+    Self::write_mov_immediate_64(Register64::Rdx, string_length, &mut self.text);
+    Self::write_syscall(&mut self.text);
+
+    Ok(())
+  }
+
+  // helper functions
+
+  /// write_mov_immediate_32 writes a mov instruction moving an immediate value (e.g. integer) into
+  /// the given register. The instructions are written into target.
+  fn write_mov_immediate_32(register: Register32, val: u32, target: &mut Vec<u8>) {
+    target.push(0xb8 + register as u8);
+    Self::write_u32(val, target);
+  }
+
+  /// write_mov_immediate_64 writes a mov instruction moving an immediate value (e.g. integer) into
+  /// the given register. The instructions are written into target.
+  fn write_mov_immediate_64(register: Register64, val: u64, target: &mut Vec<u8>) {
+    target.push(REXPrefix::Mode64Bit as u8);
+    target.push(0xb8 + register as u8);
+    Self::write_u64(val, target);
+  }
+
+  /// write_syscall writes a syscall opcode to the target vector. It uses the 64bit syscall
+  /// instruction, not the old interrupt 80.
+  fn write_syscall(target: &mut Vec<u8>) {
+    target.push(0x0f);
+    target.push(0x05);
+  }
+
+  /// Writes a little endian u32 to the vector
+  fn write_u32(data: u32, target: &mut Vec<u8>) {
+    target.push((data & 0xFF) as u8);
+    target.push(((data >> 8) & 0xFF) as u8);
+    target.push(((data >> 16) & 0xFF) as u8);
+    target.push(((data >> 24) & 0xFF) as u8);
+  }
+
+  /// Writes a little endian u64 to the vector
+  fn write_u64(data: u64, target: &mut Vec<u8>) {
+    target.push((data & 0xFF) as u8);
+    target.push(((data >> 8) & 0xFF) as u8);
+    target.push(((data >> 16) & 0xFF) as u8);
+    target.push(((data >> 24) & 0xFF) as u8);
+    target.push(((data >> 32) & 0xFF) as u8);
+    target.push(((data >> 40) & 0xFF) as u8);
+    target.push(((data >> 48) & 0xFF) as u8);
+    target.push(((data >> 56) & 0xFF) as u8);
+  }
 }
 
 // Syscalls
 // TODO: These should be 64 bits
-#[repr(u32)]
+#[repr(u64)]
 enum Syscalls {
+  Write = 1,
   Exit = 60,
+}
+
+enum BrokkrType {
+  Void,
+  UInt64,
+  Double,
+  Uint8tPtr,
+}
+
+const fn type_to_string(t: BrokkrType) -> &'static str {
+  match t {
+    BrokkrType::Void => "void",
+    BrokkrType::UInt64 => "uint64",
+    BrokkrType::Double => "double",
+    BrokkrType::Uint8tPtr => "uint8*",
+  }
+}
+
+#[repr(u64)]
+enum Register32 {
+  Eax = 0,
+  Ecx = 1,
+  Edx = 2,
+  Ebx = 3,
+  Esi = 6,
+  Edi = 7,
+}
+
+#[repr(u64)]
+enum Register64 {
+  Rax = 0,
+  Rcx = 1,
+  Rdx = 2,
+  Rbx = 3,
+  Rsi = 6,
+  Rdi = 7,
+}
+
+#[repr(u8)]
+enum REXPrefix {
+  // Enable 64 bit mode for the next opcode. Must immediately proceed the opcode
+  Mode64Bit = 0b01001000,
 }
