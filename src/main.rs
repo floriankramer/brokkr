@@ -9,6 +9,8 @@ pub mod compiler;
 
 
 fn main() -> Result<()> {
+  simple_logger::init_with_env()?;
+
   let mut stdin = std::io::stdin().lock();
 
   let mut src = String::default();

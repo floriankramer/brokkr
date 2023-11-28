@@ -47,7 +47,6 @@ impl ElfFile {
 
         // pad the size of text to a multiple of ALIGNMENT (which is a power of 2)
         let text_aligned_size = ((text.len() as u64) + ALIGNMENT - 1) & !(ALIGNMENT - 1);
-        println!("text aligned size: {} -> {}", text.len(), text_aligned_size);
 
         let data_row = ProgramHeaderTableEntry {
           p_type: ProgramHeaderType::Load,
@@ -70,12 +69,9 @@ impl ElfFile {
         out.set_permissions(PermissionsExt::from_mode(0o0755))?;
 
         // Write the header
-        println!("header: {:?}", header);
         out.write_all(bytes_of(&header))?;
         
         // write the program header table
-        println!("text_row: {:?}", text_row);
-        println!("data_row: {:?}", data_row);
         out.write_all(bytes_of(&text_row))?;
         out.write_all(bytes_of(&data_row))?;
 
