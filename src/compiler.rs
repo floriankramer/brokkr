@@ -2,7 +2,7 @@ use std::{any, collections::HashMap, error::Error, rc::Rc};
 
 use anyhow::{anyhow, Ok, Result};
 
-use crate::parser;
+use crate::{elf::ElfFile, parser};
 
 pub struct CompiledProgram {
   pub text: Vec<u8>,
@@ -57,7 +57,7 @@ struct RelativeDataLocation {
   // The offset in the text section at which the value lies
   offset: u64,
   // The value's size
-  size: u8,
+  size_bytes: u8,
   // The relative location to which the start of the data section has to be added
   relative_location: u64,
 }
@@ -138,20 +138,26 @@ impl Compiler {
               // used as function names, and then check function calls agains the global symbol
               // table and the syscall table.
               // TODO: Add the print function to this.
-              if function_name != "exit" {
-                // exit is the only supported function right now, it's a syscall
-                return Err(anyhow!("Only the exit syscall is supported right now"));
+              if function_name == "exit" {
+                self.write_syscall_exit(function_arguments)?;
+              } else if function_name == "print" {
+                self.write_syscall_print(function_arguments)?;
+              } else {
+                return Err(anyhow!("Only the exit and print are supported right now"));
               }
-
-              self.write_syscall_exit(function_arguments)?;
             }
             _ => {
               return Err(anyhow!(
-                "Statements of typpe {:?} are not supported yet",
+                "Statements of type {:?} are not supported yet",
                 typed_expression.as_rule()
               ))
             }
           }
+        }
+
+        if function_name == "main" {
+          // We should make sure the program will exit gracefully
+          self.write_syscall_exit_ok();
         }
       }
     }
@@ -161,6 +167,27 @@ impl Compiler {
     // ALIGNMENT from elf.rs as well as the KERNEL_MIN_LOAD_ADDRESS. There should probably be a
     // helper inside of elf.rs for this. It's not the cleanest separation of concerns, but should
     // be fine for this basic compiler project.
+    let data_start = ElfFile::get_aligned_data_offset(self.text.len() as u64);
+    for rewrite in self.relative_data_locations {
+      if rewrite.size_bytes == 4 {
+        Self::write_u32_at(
+          data_start as u32 + rewrite.relative_location as u32,
+          &mut self.text[..],
+          rewrite.offset as usize,
+        );
+      } else if rewrite.size_bytes == 8 {
+        Self::write_u64_at(
+          data_start + rewrite.relative_location,
+          &mut self.text[..],
+          rewrite.offset as usize,
+        );
+      } else {
+        return Err(anyhow!(
+          "got a rewrite with an unsupported size of {}",
+          rewrite.size_bytes
+        ));
+      }
+    }
 
     Ok(CompiledProgram {
       text: self.text,
@@ -201,6 +228,13 @@ impl Compiler {
     Ok(())
   }
 
+  fn write_syscall_exit_ok(&mut self) {
+    // call the exit syscall with a single return code argument
+    Self::write_mov_immediate_64(Register64::Rax, Syscalls::Exit as u64, &mut self.text);
+    Self::write_mov_immediate_64(Register64::Rdi, 0, &mut self.text);
+    Self::write_syscall(&mut self.text);
+  }
+
   // TODO: The syscall is write, print should just be a wrapper around that.
   fn write_syscall_print(
     &mut self,
@@ -226,7 +260,8 @@ impl Compiler {
       ));
     }
 
-    let string_literal = first_arg.as_str().to_string();
+    // the literal is surrounded by qutation marks
+    let string_literal = first_arg.as_str()[1..first_arg.as_str().len() - 1].to_string();
     let string_length: u64 = second_arg.as_str().parse()?;
 
     // add the string literal to the data section
@@ -242,7 +277,7 @@ impl Compiler {
     self.relative_data_locations.push(RelativeDataLocation {
       // the mov instruction takes 2 bytes.
       offset: self.text.len() as u64 + 2,
-      size: 8,
+      size_bytes: 8,
       relative_location: relative_literal_location,
     });
     Self::write_mov_immediate_64(Register64::Rsi, relative_literal_location, &mut self.text);
@@ -294,6 +329,26 @@ impl Compiler {
     target.push(((data >> 40) & 0xFF) as u8);
     target.push(((data >> 48) & 0xFF) as u8);
     target.push(((data >> 56) & 0xFF) as u8);
+  }
+
+  /// Writes a little endian u32 to the vector
+  fn write_u32_at(data: u32, target: &mut [u8], offset: usize) {
+    target[offset] = (data & 0xFF) as u8;
+    target[offset + 1] = ((data >> 8) & 0xFF) as u8;
+    target[offset + 2] = ((data >> 16) & 0xFF) as u8;
+    target[offset + 3] = ((data >> 24) & 0xFF) as u8;
+  }
+
+  /// Writes a little endian u64 to the vector
+  fn write_u64_at(data: u64, target: &mut [u8], offset: usize) {
+    target[offset] = (data & 0xFF) as u8;
+    target[offset + 1] = ((data >> 8) & 0xFF) as u8;
+    target[offset + 2] = ((data >> 16) & 0xFF) as u8;
+    target[offset + 3] = ((data >> 24) & 0xFF) as u8;
+    target[offset + 4] = ((data >> 32) & 0xFF) as u8;
+    target[offset + 5] = ((data >> 40) & 0xFF) as u8;
+    target[offset + 6] = ((data >> 48) & 0xFF) as u8;
+    target[offset + 7] = ((data >> 56) & 0xFF) as u8;
   }
 }
 
