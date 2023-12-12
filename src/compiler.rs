@@ -17,9 +17,13 @@ pub struct Compiler {
   // The compiled data section
   data: Vec<u8>,
   symbols: HashMap<String, Symbol>,
-  local_symbols: HashMap<String, LocalSymbol>,
 
   functions: HashMap<String, FunctionSymbol>,
+
+  // This mirrors the structure of the local vars on the stack
+  local_variables: Vec<LocalSymbol>,
+  // This allows for indexing local variables
+  local_symbols: HashMap<String, usize>,
 
   relative_data_locations: Vec<RelativeDataLocation>,
   relative_call_locations: Vec<RelativeCallLocation>,
@@ -48,9 +52,11 @@ struct FunctionSymbol {
 
 /// LocalSymbol represents a symbol in the local context, by combining it with a bracket depth.
 struct LocalSymbol {
-  symbol: Symbol,
+  name: String,
+  addr: u64,
   // The depth in braces of this symbol. Used to keep symbols inside of e.g. if clauses.
   depth: u64,
+  brokke_type: BrokkrType,
 }
 
 // representation for Immediate values. DataAddr are understood to be relative to the start of the
@@ -222,6 +228,30 @@ impl Compiler {
       let typed_expression = expression.into_inner().next().unwrap();
 
       match typed_expression.as_rule() {
+        parser::Rule::declaration_expression => {
+          // Declares a new variable
+          let parts: Vec<_> = typed_expression.into_inner().collect();
+
+          let var_type = BrokkrType::try_from(parts[0].clone())
+            .with_context(|| "Unable to parse a variable type")?;
+
+          let var_name = parts[1].as_str().to_string();
+
+          // Do inititalization stuff
+
+          // put it onto the stack
+          self.write_push_64(Register64::Rax);
+
+          self
+            .local_symbols
+            .insert(var_name.clone(), self.local_variables.len());
+          self.local_variables.push(LocalSymbol {
+            name: var_name,
+            addr: self.local_variables.len() as u64,
+            depth: 0,
+            brokke_type: var_type,
+          });
+        }
         parser::Rule::call_expression => {
           let call_parts: Vec<_> = typed_expression.into_inner().collect();
 
@@ -252,7 +282,7 @@ impl Compiler {
             } else {
               // TODO: handle user defined functions
               return Err(anyhow!(
-                "Only the exit and print built-ins are supported right now"
+                "Only the exit and print built-ins are supported right now, and {} is not a user-defined function", function_name
               ));
             }
           }
@@ -265,6 +295,14 @@ impl Compiler {
         }
       }
     }
+
+    // drop the variables
+    // TODO: test this:
+    self.write_add_immediate(Register64::Rsp, self.local_symbols.len() as i32);
+    self.local_variables.clear();
+    self.local_symbols.clear();
+
+
     Ok(())
   }
 
@@ -408,6 +446,52 @@ impl Compiler {
   fn write_ret_near(&mut self) {
     // The far call opcode
     self.text.push(0xc3);
+  }
+
+  fn write_push_64(&mut self, register: Register64) {
+    // Enforce 64 bit mode (might not be required, the default is controlled by the D flag of the
+    // current code segment, whatever that means)
+    self.text.push(REXPrefix::Mode64Bit as u8);
+    self.text.push(0x50 + register as u8);
+  }
+
+  fn write_pop_64(&mut self, register: Register64) {
+    // Enforce 64 bit mode (might not be required, the default is controlled by the D flag of the
+    // current code segment, whatever that means)
+    self.text.push(REXPrefix::Mode64Bit as u8);
+    self.text.push(0x58 + register as u8);
+  }
+
+  fn write_sub_rax_immediate(&mut self, val: i32) {
+    self.text.push(REXPrefix::Mode64Bit as u8);
+    self.text.push(0x2d);
+    Self::write_i32(val, &mut self.text);
+  }
+
+  fn write_add_rax_immediate(&mut self, val: i32) {
+    self.text.push(REXPrefix::Mode64Bit as u8);
+    self.text.push(0x05);
+    Self::write_i32(val, &mut self.text);
+  }
+
+  fn write_add_immediate(&mut self, register: Register64, val: i32) {
+    self.text.push(REXPrefix::Mode64Bit as u8);
+    self.text.push(0x81);
+    // TODO: This needs to be tested and verified. There is a modr/m addressing table in the intel
+    // manual, but I couldn't find it again.
+    // push the modr/m byte
+    self.text.push(register as u8)
+
+  }
+
+  fn write_sub_immediate(&mut self, register: Register64, val: i32) {
+    // The 101 bits in the prefix 
+    self.text.push(REXPrefix::Mode64Bit as u8);
+    self.text.push(0x81);
+    // TODO: This needs to be tested and verified. There is a modr/m addressing table in the intel
+    // manual, but I couldn't find it again.
+    // push the modr/m byte the 101 in the center does subtraction
+    self.text.push(0b00101000 + register as u8)
   }
 
   /// write_mov_immediate_32 writes a mov instruction moving an immediate value (e.g. integer) into
@@ -617,16 +701,22 @@ enum Register32 {
   Ecx = 1,
   Edx = 2,
   Ebx = 3,
+  Esp = 4,
+  Ebp = 5,
   Esi = 6,
   Edi = 7,
 }
 
+/// Register64 64 bit registers. Their numeric values are used in e.g. mov instructions. The actual
+/// values are taken from table B-4 in volume 2 of the intel programmers manual. 
 #[repr(u64)]
 enum Register64 {
   Rax = 0,
   Rcx = 1,
   Rdx = 2,
   Rbx = 3,
+  Rsp = 4,
+  Rbp = 5,
   Rsi = 6,
   Rdi = 7,
 }
@@ -635,6 +725,7 @@ enum Register64 {
 enum REXPrefix {
   // Enable 64 bit mode for the next opcode. Must immediately proceed the opcode
   Mode64Bit = 0b01001000,
+  // Rex.R could be nice to access registers r8-r15
 }
 
 const FD_STDOUT: u64 = 1;
