@@ -28,7 +28,10 @@ float_literal = { "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 array_literal = { "[" ~ (integer_literal)? ~ ("," ~ integer_literal)* ~ "]"}
 
 // Expressions (assignment, call, if, while, invert)
-expression = { assignment_expression | call_expression | if_expression | while_expression | invert_expression | return_expression }
+expression = { assignment_expression | call_expression | if_expression | while_expression | invert_expression | return_expression | declaration_expression }
+
+// Declarations which create a new variable
+declaration_expression = { types ~ name ~ (assignment_expression ~ literal)? ~ terminator }
 
 // Assignments which modify in place
 assignment_expression = { types? ~ name ~ assignment_operation ~ (name | literal) ~ terminator }

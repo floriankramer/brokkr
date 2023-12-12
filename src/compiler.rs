@@ -1,6 +1,6 @@
 use std::{any, collections::HashMap, error::Error, rc::Rc};
 
-use anyhow::{anyhow, Ok, Result};
+use anyhow::{anyhow, Context, Ok, Result};
 
 use crate::{elf::ElfFile, parser};
 
@@ -19,7 +19,10 @@ pub struct Compiler {
   symbols: HashMap<String, Symbol>,
   local_symbols: HashMap<String, LocalSymbol>,
 
+  functions: HashMap<String, FunctionSymbol>,
+
   relative_data_locations: Vec<RelativeDataLocation>,
+  function_address_locations: Vec<FunctionAddressLocation>,
 }
 
 enum Symbol {
@@ -50,6 +53,14 @@ struct LocalSymbol {
   depth: u64,
 }
 
+// representation for Immediate values. DataAddr are understood to be relative to the start of the
+// data section
+enum Immediate64 {
+  Val(u64),
+  DataAddr(u64),
+  FunctionAddr(String),
+}
+
 /// RelativeDataLocation describes an address in the data section of the compiled code. These need
 /// to be stored during compilation, and then updated once the location of the data section is
 /// known.
@@ -62,6 +73,14 @@ struct RelativeDataLocation {
   relative_location: u64,
 }
 
+// FunctionAddressLocation describe a function address. These need to be stored during compilation,
+// and then updated afterwards, once all function locations are known.
+struct FunctionAddressLocation {
+  offset: u64,
+  size_bytes: u8,
+  function_name: String,
+}
+
 impl Compiler {
   pub fn compile(
     mut self,
@@ -69,13 +88,14 @@ impl Compiler {
   ) -> Result<CompiledProgram> {
     // Collect global symbol information (functions and values)
     // this populates self.symbols
-    self.collect_smbols()?;
+    self.collect_symbols(parsed.clone())?;
 
     // Initialize the data section from globals
 
     // Build the text section from the functions
+    // The entry point of our program. It will point at the location of the main function.
+    let mut entrypoint = 0;
 
-    // For now, we only look at the main function
     for value in parsed {
       if value.as_rule() == parser::Rule::function {
         let mut function_parts = value.into_inner();
@@ -86,87 +106,44 @@ impl Compiler {
           ));
         }
 
-        let signature = function_parts.next().unwrap();
-        let mut body = function_parts.next().unwrap().into_inner();
+        let signature = FunctionSignature::try_from(function_parts.next().unwrap())?;
+        let body = function_parts.next().unwrap().into_inner();
 
-        let mut signature_parts = signature.into_inner();
-        let return_type = signature_parts.next().unwrap();
-        let function_name = signature_parts.next().unwrap().as_str().to_string();
-
-        let mut function_arguments = signature_parts.next().unwrap().into_inner();
-
-        // Debug code
-        if function_name != "main" {
-          log::info!("Ignoring non main function {} in this build", function_name);
-          continue;
-        }
-
-        if function_name == "main" {
+        if signature.name == "main" {
           // sanity checks
-          if function_arguments.clone().next().is_some() {
+          if !signature.arguments.is_empty() {
             return Err(anyhow!("the main function may not take any arguments"));
           }
 
-          if return_type.as_str() != type_to_string(BrokkrType::UInt64) {
+          if signature.return_type != BrokkrType::UInt64 {
             return Err(anyhow!(
               "the main function must return {}",
               type_to_string(BrokkrType::UInt64)
             ));
           }
-        }
 
-        // compile the function
-        // TODO: we want a local function table that tracks scoped variables.
-        for expression in body {
-          let typed_expression = expression.into_inner().next().unwrap();
-
-          match typed_expression.as_rule() {
-            parser::Rule::call_expression => {
-              let call_parts: Vec<_> = typed_expression.into_inner().collect();
-
-              // <name> <args> <terminator>
-              if call_parts.len() != 3 {
-                return Err(anyhow!(
-                  "Assigning the result of a function to a variable is not yet supported"
-                ));
-              }
-
-              let function_name = call_parts[0].as_str().to_string();
-              let function_arguments: Vec<_> = call_parts[1].clone().into_inner().collect();
-
-              // TODO: To handle this properly we want a list of syscalls, prevent those from being
-              // used as function names, and then check function calls agains the global symbol
-              // table and the syscall table.
-              // TODO: Add the print function to this.
-              if function_name == "exit" {
-                self.write_syscall_exit(function_arguments)?;
-              } else if function_name == "print" {
-                self.write_syscall_print(function_arguments)?;
-              } else {
-                return Err(anyhow!("Only the exit and print are supported right now"));
-              }
-            }
-            _ => {
-              return Err(anyhow!(
-                "Statements of type {:?} are not supported yet",
-                typed_expression.as_rule()
-              ))
-            }
+          // This is now the entry point
+          entrypoint = self.text.len() as u64;
+        } else {
+          // Update the function table with the location of this function
+          match self.functions.get_mut(&signature.name) {
+            Some(f) => {f.relative_address = Some(self.text.len() as u64);}
+            None => {return Err(anyhow!("Ran into a function signature that was not in the function symbol table during compilation: {}", signature.name))}
           }
         }
 
-        if function_name == "main" {
+        // compile the function
+        self.compile_function(body)?;
+
+        if signature.name == "main" {
           // We should make sure the program will exit gracefully
           self.write_syscall_exit_ok();
         }
       }
     }
 
-    // TODO: Adjust relative data locations
     // iterate the relative_data_locations and calculate their in memory locations using the
-    // ALIGNMENT from elf.rs as well as the KERNEL_MIN_LOAD_ADDRESS. There should probably be a
-    // helper inside of elf.rs for this. It's not the cleanest separation of concerns, but should
-    // be fine for this basic compiler project.
+    // ALIGNMENT from elf.rs as well as the KERNEL_MIN_LOAD_ADDRESS.
     let data_start = ElfFile::get_aligned_data_offset(self.text.len() as u64);
     for rewrite in self.relative_data_locations {
       if rewrite.size_bytes == 4 {
@@ -183,7 +160,39 @@ impl Compiler {
         );
       } else {
         return Err(anyhow!(
-          "got a rewrite with an unsupported size of {}",
+          "got a data address rewrite with an unsupported size of {}",
+          rewrite.size_bytes
+        ));
+      }
+    }
+
+    // Rewrite function address locations
+    for rewrite in self.function_address_locations {
+      let function = match self.functions.get(&rewrite.function_name) {
+        Some(f) => f,
+        None => {
+          return Err(anyhow!(
+            "Got a function address rewrite for unknown function {}",
+            rewrite.function_name
+          ));
+        }
+      };
+
+      let function_addr = match function.relative_address {
+        Some(a) => a,
+        None => {
+          return Err(anyhow!(
+            "Tried to rewrite address of function {} but it doesn't have an address set",
+            rewrite.function_name
+          ));
+        }
+      };
+
+      if rewrite.size_bytes == 8 {
+        Self::write_u64_at(function_addr, &mut self.text[..], rewrite.offset as usize);
+      } else {
+        return Err(anyhow!(
+          "got a function address rewrite with an unsupported size of {}",
           rewrite.size_bytes
         ));
       }
@@ -192,16 +201,91 @@ impl Compiler {
     Ok(CompiledProgram {
       text: self.text,
       data: self.data,
-      entrypoint: 0,
+      entrypoint,
     })
   }
 
-  fn collect_smbols(&mut self) -> Result<()> {
+  /// compile_function takes a function body and turns it into machine code, appending it to text
+  /// at the end of the current text section.
+  fn compile_function(&mut self, body: pest::iterators::Pairs<'_, parser::Rule>) -> Result<()> {
+    // TODO: we want a local function table that tracks scoped variables.
+
+    for expression in body {
+      let typed_expression = expression.into_inner().next().unwrap();
+
+      match typed_expression.as_rule() {
+        parser::Rule::call_expression => {
+          let call_parts: Vec<_> = typed_expression.into_inner().collect();
+
+          // <name> <args> <terminator>
+          if call_parts.len() != 3 {
+            return Err(anyhow!(
+              "Assigning the result of a function to a variable is not yet supported"
+            ));
+          }
+
+          let function_name = call_parts[0].as_str().to_string();
+          let function_arguments: Vec<_> = call_parts[1].clone().into_inner().collect();
+
+          // TODO: To handle this properly we want a list of syscalls, prevent those from being
+          // used as function names, and then check function calls agains the global symbol
+          // table and the syscall table.
+          if function_name == "exit" {
+            self.write_syscall_exit(function_arguments)?;
+          } else if function_name == "print" {
+            self.write_syscall_print(function_arguments)?;
+          } else {
+            // TODO: handle user defined functions 
+            return Err(anyhow!("Only the exit and print are supported right now"));
+          }
+        }
+        _ => {
+          return Err(anyhow!(
+            "Statements of type {:?} are not supported yet",
+            typed_expression.as_rule()
+          ))
+        }
+      }
+    }
+    Ok(())
+  }
+
+  fn collect_symbols(&mut self, parsed: pest::iterators::Pairs<'_, parser::Rule>) -> Result<()> {
+    for value in parsed {
+      match value.as_rule() {
+        parser::Rule::function => {
+          let v = value.into_inner().next().unwrap();
+
+          let signature = FunctionSignature::try_from(v)?;
+
+          // TODO: check the signature against the list of built-ins and error if there is a
+          // built-in with the same name.
+
+          self.functions.insert(
+            signature.name,
+            FunctionSymbol {
+              relative_address: None,
+              arguments: signature.arguments,
+              return_type: signature.return_type,
+            },
+          );
+        }
+        parser::Rule::global_definition => {
+          panic!("globals are not yet supported");
+        }
+        parser::Rule::EOI => {}
+        _ => {
+          return Err(anyhow!(
+            "Expected only functions and globals at the global scope, got '{}'",
+            value.as_str()
+          ));
+        }
+      }
+    }
     Ok(())
   }
 
   // syscalls
-
   fn write_syscall_exit(
     &mut self,
     arguments: Vec<pest::iterators::Pair<'_, parser::Rule>>,
@@ -221,18 +305,18 @@ impl Compiler {
     let ret_code: u64 = first_arg.as_str().parse()?;
 
     // call the exit syscall with a single return code argument
-    Self::write_mov_immediate_64(Register64::Rax, Syscalls::Exit as u64, &mut self.text);
-    Self::write_mov_immediate_64(Register64::Rdi, ret_code, &mut self.text);
-    Self::write_syscall(&mut self.text);
+    self.write_mov_immediate_64(Register64::Rax, Immediate64::Val(Syscalls::Exit as u64));
+    self.write_mov_immediate_64(Register64::Rdi, Immediate64::Val(ret_code));
+    self.write_syscall();
 
     Ok(())
   }
 
   fn write_syscall_exit_ok(&mut self) {
     // call the exit syscall with a single return code argument
-    Self::write_mov_immediate_64(Register64::Rax, Syscalls::Exit as u64, &mut self.text);
-    Self::write_mov_immediate_64(Register64::Rdi, 0, &mut self.text);
-    Self::write_syscall(&mut self.text);
+    self.write_mov_immediate_64(Register64::Rax, Immediate64::Val(Syscalls::Exit as u64));
+    self.write_mov_immediate_64(Register64::Rdi, Immediate64::Val(0));
+    self.write_syscall();
   }
 
   // TODO: The syscall is write, print should just be a wrapper around that.
@@ -240,7 +324,7 @@ impl Compiler {
     &mut self,
     arguments: Vec<pest::iterators::Pair<'_, parser::Rule>>,
   ) -> Result<()> {
-    if arguments.len() != 2 {
+    if arguments.len() != 2 && arguments.len() != 1 {
       return Err(anyhow!("The print function takes exactly two arguments"));
     }
 
@@ -252,40 +336,40 @@ impl Compiler {
       ));
     }
 
-    let second_arg = arguments[1].clone().into_inner().next().unwrap();
-    if second_arg.as_rule() != parser::Rule::integer_literal {
-      return Err(anyhow!(
-        "The print function currently only supports integer literals, but got a {:?}",
-        first_arg.as_rule()
-      ));
-    }
+    // The second arg is only used for the variable version of this
+    // let second_arg = arguments[1].clone().into_inner().next().unwrap();
+    // if second_arg.as_rule() != parser::Rule::integer_literal {
+    //   return Err(anyhow!(
+    //     "The print function currently only supports integer literals, but got a {:?}",
+    //     first_arg.as_rule()
+    //   ));
+    // }
 
     // the literal is surrounded by qutation marks
     let string_literal = first_arg.as_str()[1..first_arg.as_str().len() - 1].to_string();
-    let string_length: u64 = second_arg.as_str().parse()?;
+    // let string_length: u64 = second_arg.as_str().parse()?;
+    let string_length = string_literal.len() as u64;
 
     // add the string literal to the data section
-    let relative_literal_location = self.data.len() as u64;
-    self.data.extend_from_slice(string_literal.as_bytes());
+    let relative_literal_location = self.data_add_string(&string_literal);
 
     // call the exit syscall with a single return code argument
-    Self::write_mov_immediate_64(Register64::Rax, Syscalls::Write as u64, &mut self.text);
-    Self::write_mov_immediate_64(Register64::Rdi, 1, &mut self.text);
+    self.write_mov_immediate_64(Register64::Rax, Immediate64::Val(Syscalls::Write as u64));
+    self.write_mov_immediate_64(Register64::Rdi, Immediate64::Val(FD_STDOUT));
 
     // We refer to the literal in the data section here and need to modify this later on to hold
     // the actual location of the data.
-    self.relative_data_locations.push(RelativeDataLocation {
-      // the mov instruction takes 2 bytes.
-      offset: self.text.len() as u64 + 2,
-      size_bytes: 8,
-      relative_location: relative_literal_location,
-    });
-    Self::write_mov_immediate_64(Register64::Rsi, relative_literal_location, &mut self.text);
-    Self::write_mov_immediate_64(Register64::Rdx, string_length, &mut self.text);
-    Self::write_syscall(&mut self.text);
+    self.write_mov_immediate_64(
+      Register64::Rsi,
+      Immediate64::DataAddr(relative_literal_location),
+    );
+    self.write_mov_immediate_64(Register64::Rdx, Immediate64::Val(string_length));
+    self.write_syscall();
 
     Ok(())
   }
+
+  fn write_syscall_write(&mut self, arguments: Vec<pest::iterators::Pair<'_, parser::Rule>>) {}
 
   // helper functions
 
@@ -298,17 +382,38 @@ impl Compiler {
 
   /// write_mov_immediate_64 writes a mov instruction moving an immediate value (e.g. integer) into
   /// the given register. The instructions are written into target.
-  fn write_mov_immediate_64(register: Register64, val: u64, target: &mut Vec<u8>) {
-    target.push(REXPrefix::Mode64Bit as u8);
-    target.push(0xb8 + register as u8);
-    Self::write_u64(val, target);
+  fn write_mov_immediate_64(&mut self, register: Register64, val: Immediate64) {
+    self.text.push(REXPrefix::Mode64Bit as u8);
+    self.text.push(0xb8 + register as u8);
+    match val {
+      Immediate64::Val(v) => Self::write_u64(v, &mut self.text),
+      Immediate64::DataAddr(a) => {
+        self.relative_data_locations.push(RelativeDataLocation {
+          // the mov instruction takes 2 bytes.
+          offset: self.text.len() as u64,
+          size_bytes: 8,
+          relative_location: a,
+        });
+        Self::write_u64(a, &mut self.text);
+      }
+      Immediate64::FunctionAddr(a) => {
+        self
+          .function_address_locations
+          .push(FunctionAddressLocation {
+            offset: self.text.len() as u64,
+            size_bytes: 8,
+            function_name: a,
+          });
+        Self::write_u64(0, &mut self.text);
+      }
+    }
   }
 
-  /// write_syscall writes a syscall opcode to the target vector. It uses the 64bit syscall
+  /// write_syscall writes a syscall opcode to the text section. It uses the 64bit syscall
   /// instruction, not the old interrupt 80.
-  fn write_syscall(target: &mut Vec<u8>) {
-    target.push(0x0f);
-    target.push(0x05);
+  fn write_syscall(&mut self) {
+    self.text.push(0x0f);
+    self.text.push(0x05);
   }
 
   /// Writes a little endian u32 to the vector
@@ -350,6 +455,64 @@ impl Compiler {
     target[offset + 6] = ((data >> 48) & 0xFF) as u8;
     target[offset + 7] = ((data >> 56) & 0xFF) as u8;
   }
+
+  /// data_add_string adds the string to the data section and returns its relative address
+  fn data_add_string(&mut self, val: &str) -> u64 {
+    let addr = self.data.len();
+    self.data.extend_from_slice(val.as_bytes());
+
+    addr as u64
+  }
+}
+
+/// Holds a function's signature. Function signatures need to be parsed in several places, this is
+/// used to be able to write a parsing function for them.
+struct FunctionSignature {
+  name: String,
+  return_type: BrokkrType,
+  arguments: Vec<BrokkrType>,
+}
+
+impl TryFrom<pest::iterators::Pair<'_, parser::Rule>> for FunctionSignature {
+  type Error = anyhow::Error;
+
+  fn try_from(
+    value: pest::iterators::Pair<'_, parser::Rule>,
+  ) -> std::result::Result<Self, Self::Error> {
+    if value.as_rule() != parser::Rule::function_signature {
+      return Err(anyhow!(
+        "unable to parse non-function-signature as function signature."
+      ));
+    }
+
+    let parts: Vec<_> = value.clone().into_inner().collect();
+
+    let return_type = BrokkrType::try_from(parts[0].clone())
+      .with_context(|| format!("Unable to parse function signature type {}", value.as_str()))?;
+
+    let name = parts[1].as_str().to_string();
+
+    let mut args = Vec::new();
+    let mut arg_iter = parts[2].clone().into_inner();
+    loop {
+      let arg_type = BrokkrType::try_from(match arg_iter.next() {
+        Some(v) => v,
+        None => break,
+      })
+      .with_context(|| format!("Unable to parse function argument in {}", parts[2].as_str()))?;
+      args.push(arg_type);
+
+      // consume the name and a comma
+      arg_iter.next();
+      arg_iter.next();
+    }
+
+    Ok(FunctionSignature {
+      name,
+      return_type,
+      arguments: args,
+    })
+  }
 }
 
 // Syscalls
@@ -360,11 +523,34 @@ enum Syscalls {
   Exit = 60,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BrokkrType {
   Void,
   UInt64,
   Double,
   Uint8tPtr,
+}
+
+impl TryFrom<pest::iterators::Pair<'_, parser::Rule>> for BrokkrType {
+  type Error = anyhow::Error;
+
+  fn try_from(
+    value: pest::iterators::Pair<'_, parser::Rule>,
+  ) -> std::result::Result<Self, Self::Error> {
+    if value.as_rule() != parser::Rule::types {
+      return Err(anyhow!("unable to parse non brokkr-type as brokkr type."));
+    }
+
+    let text = value.as_str();
+
+    match text {
+      "void" => Ok(BrokkrType::Void),
+      "uint64" => Ok(BrokkrType::UInt64),
+      "double" => Ok(BrokkrType::Double),
+      "uint8*" => Ok(BrokkrType::Uint8tPtr),
+      _ => Err(anyhow!("{} is not a valid brokrr type", text)),
+    }
+  }
 }
 
 const fn type_to_string(t: BrokkrType) -> &'static str {
@@ -401,3 +587,5 @@ enum REXPrefix {
   // Enable 64 bit mode for the next opcode. Must immediately proceed the opcode
   Mode64Bit = 0b01001000,
 }
+
+const FD_STDOUT: u64 = 1;
