@@ -22,7 +22,7 @@ pub struct Compiler {
   functions: HashMap<String, FunctionSymbol>,
 
   relative_data_locations: Vec<RelativeDataLocation>,
-  function_address_locations: Vec<FunctionAddressLocation>,
+  relative_call_locations: Vec<RelativeCallLocation>,
 }
 
 enum Symbol {
@@ -58,7 +58,6 @@ struct LocalSymbol {
 enum Immediate64 {
   Val(u64),
   DataAddr(u64),
-  FunctionAddr(String),
 }
 
 /// RelativeDataLocation describes an address in the data section of the compiled code. These need
@@ -75,7 +74,7 @@ struct RelativeDataLocation {
 
 // FunctionAddressLocation describe a function address. These need to be stored during compilation,
 // and then updated afterwards, once all function locations are known.
-struct FunctionAddressLocation {
+struct RelativeCallLocation {
   offset: u64,
   size_bytes: u8,
   function_name: String,
@@ -138,6 +137,10 @@ impl Compiler {
         if signature.name == "main" {
           // We should make sure the program will exit gracefully
           self.write_syscall_exit_ok();
+        } else {
+          // The function must return. This allows for writing void functions without a
+          // return statement.
+          self.write_ret_near();
         }
       }
     }
@@ -167,7 +170,7 @@ impl Compiler {
     }
 
     // Rewrite function address locations
-    for rewrite in self.function_address_locations {
+    for rewrite in self.relative_call_locations {
       let function = match self.functions.get(&rewrite.function_name) {
         Some(f) => f,
         None => {
@@ -188,8 +191,13 @@ impl Compiler {
         }
       };
 
-      if rewrite.size_bytes == 8 {
-        Self::write_u64_at(function_addr, &mut self.text[..], rewrite.offset as usize);
+      // The jump is relative to the start of the next instruction, which is why 4 bytes are added
+      // for the 4 byte argument to the near jump.
+      let offset: i32 = (function_addr as i32) - ((rewrite.offset as i32) + 4);
+
+      // Near jump's in 64 bit mode expect 32bit arguments.
+      if rewrite.size_bytes == 4 {
+        Self::write_i32_at(offset, &mut self.text[..], rewrite.offset as usize);
       } else {
         return Err(anyhow!(
           "got a function address rewrite with an unsupported size of {}",
@@ -227,16 +235,26 @@ impl Compiler {
           let function_name = call_parts[0].as_str().to_string();
           let function_arguments: Vec<_> = call_parts[1].clone().into_inner().collect();
 
-          // TODO: To handle this properly we want a list of syscalls, prevent those from being
-          // used as function names, and then check function calls agains the global symbol
-          // table and the syscall table.
-          if function_name == "exit" {
-            self.write_syscall_exit(function_arguments)?;
-          } else if function_name == "print" {
-            self.write_syscall_print(function_arguments)?;
+          let function = self.functions.get(&function_name);
+
+          if let Some(_f) = function {
+            // There is a function in the global symbol table.
+            // TODO: push the function arguments onto the stack
+            self.write_call_near(function_name.clone());
           } else {
-            // TODO: handle user defined functions 
-            return Err(anyhow!("Only the exit and print are supported right now"));
+            // TODO: To handle this properly we want a list of syscalls, prevent those from being
+            // used as function names, and then check function calls agains the global symbol
+            // table and the syscall table.
+            if function_name == "exit" {
+              self.write_syscall_exit(function_arguments)?;
+            } else if function_name == "print" {
+              self.write_syscall_print(function_arguments)?;
+            } else {
+              // TODO: handle user defined functions
+              return Err(anyhow!(
+                "Only the exit and print built-ins are supported right now"
+              ));
+            }
           }
         }
         _ => {
@@ -373,6 +391,25 @@ impl Compiler {
 
   // helper functions
 
+  fn write_call_near(&mut self, target: String) {
+    // The relative near call opcode
+    self.text.push(0xe8);
+
+    // We are running in 64-bit mode, so the operand is always 32bits
+    self.relative_call_locations.push(RelativeCallLocation {
+      offset: self.text.len() as u64,
+      size_bytes: 4,
+      function_name: target,
+    });
+
+    Self::write_u32(0, &mut self.text);
+  }
+
+  fn write_ret_near(&mut self) {
+    // The far call opcode
+    self.text.push(0xc3);
+  }
+
   /// write_mov_immediate_32 writes a mov instruction moving an immediate value (e.g. integer) into
   /// the given register. The instructions are written into target.
   fn write_mov_immediate_32(register: Register32, val: u32, target: &mut Vec<u8>) {
@@ -396,16 +433,6 @@ impl Compiler {
         });
         Self::write_u64(a, &mut self.text);
       }
-      Immediate64::FunctionAddr(a) => {
-        self
-          .function_address_locations
-          .push(FunctionAddressLocation {
-            offset: self.text.len() as u64,
-            size_bytes: 8,
-            function_name: a,
-          });
-        Self::write_u64(0, &mut self.text);
-      }
     }
   }
 
@@ -414,6 +441,28 @@ impl Compiler {
   fn write_syscall(&mut self) {
     self.text.push(0x0f);
     self.text.push(0x05);
+  }
+
+  /// Writes a little endian two's complement i32 to the vector
+  fn write_i32_at(data: i32, target: &mut [u8], offset: usize) {
+    unsafe {
+      let v = std::mem::transmute::<i32, u32>(data);
+
+      target[offset] = (v & 0xFF) as u8;
+      target[offset + 1] = ((v >> 8) & 0xFF) as u8;
+      target[offset + 2] = ((v >> 16) & 0xFF) as u8;
+      target[offset + 3] = ((v >> 24) & 0xFF) as u8;
+    }
+  }
+
+  fn write_i32(data: i32, target: &mut Vec<u8>) {
+    unsafe {
+      let v = std::mem::transmute::<i32, u32>(data);
+      target.push((v & 0xFF) as u8);
+      target.push(((v >> 8) & 0xFF) as u8);
+      target.push(((v >> 16) & 0xFF) as u8);
+      target.push(((v >> 24) & 0xFF) as u8);
+    }
   }
 
   /// Writes a little endian u32 to the vector
@@ -589,3 +638,46 @@ enum REXPrefix {
 }
 
 const FD_STDOUT: u64 = 1;
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_write_u32() {
+    let v = 0b0110010110011101101110001010110;
+    let mut target = Vec::new();
+
+    Compiler::write_u32(v, &mut target);
+    assert_eq!(target[0], 0b01010110);
+    assert_eq!(target[1], 0b11011100);
+    assert_eq!(target[2], 0b11001110);
+    assert_eq!(target[3], 0b00110010);
+  }
+
+  #[test]
+  fn test_write_i32() {
+    let v = -0b1110010110011101101110001010110;
+    let mut target = Vec::new();
+
+    println!("v: {}", v);
+    println!("v & 0xFF: {}", v & 0xFF);
+
+    // These bits are the  binary number, that fulfills -(1 << 32) + x = 0b1110010110011101101110001010110
+    Compiler::write_i32(v, &mut target);
+    assert_eq!(target[0], 0b10101010);
+    assert_eq!(target[1], 0b00100011);
+    assert_eq!(target[2], 0b00110001);
+    assert_eq!(target[3], 0b10001101);
+
+    target.push(0);
+    target.push(0);
+    target.push(0);
+    target.push(0);
+    Compiler::write_i32_at(v, &mut target[..], 4);
+    assert_eq!(target[4], 0b10101010);
+    assert_eq!(target[5], 0b00100011);
+    assert_eq!(target[6], 0b00110001);
+    assert_eq!(target[7], 0b10001101);
+  }
+}
